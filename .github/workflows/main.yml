@@ -13,12 +13,18 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Debug repository files
+        run: |
+          pwd
+          find . -maxdepth 3 -type f | sort
+          python --version
 
       - name: Send daily digest
         env:
