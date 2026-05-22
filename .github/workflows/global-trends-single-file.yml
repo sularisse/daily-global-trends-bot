@@ -1,0 +1,230 @@
+name: Daily Global Trends Telegram Digest
+
+on:
+  schedule:
+    # 台灣時間 07:00 = UTC 前一天 23:00
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Generate and send digest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import email.utils
+          import html
+          import json
+          import os
+          import textwrap
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          RSS_QUERIES = [
+              "global economy OR markets OR inflation when:2d",
+              "geopolitics OR war OR election OR diplomacy when:2d",
+              "artificial intelligence OR technology OR cybersecurity when:2d",
+              "climate OR energy OR oil OR renewable when:2d",
+              "health OR science OR outbreak OR space when:2d",
+              "supply chain OR semiconductor OR critical minerals when:2d",
+          ]
+
+          def require_env(name):
+              value = os.getenv(name, "").strip()
+              if not value:
+                  raise RuntimeError(f"Missing required secret/env: {name}")
+              return value
+
+          def fetch_url(url, data=None, headers=None):
+              req = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 daily-global-trends-bot",
+                      **(headers or {}),
+                  },
+                  method="POST" if data else "GET",
+              )
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  return res.read()
+
+          def fetch_google_news(query):
+              params = {
+                  "q": query,
+                  "hl": "en-US",
+                  "gl": "US",
+                  "ceid": "US:en",
+              }
+              url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(params)
+              root = ET.fromstring(fetch_url(url))
+
+              items = []
+              for item in root.findall("./channel/item")[:12]:
+                  title = html.unescape((item.findtext("title") or "").strip())
+                  link = (item.findtext("link") or "").strip()
+                  source = (item.findtext("source") or "").strip()
+                  pub_raw = item.findtext("pubDate") or ""
+                  published = pub_raw
+
+                  try:
+                      if pub_raw:
+                          published = email.utils.parsedate_to_datetime(pub_raw).isoformat()
+                  except Exception:
+                      pass
+
+                  if title and link:
+                      items.append({
+                          "title": title,
+                          "source": source,
+                          "url": link,
+                          "published": published,
+                      })
+              return items
+
+          def collect_items():
+              seen = set()
+              out = []
+              for query in RSS_QUERIES:
+                  for item in fetch_google_news(query):
+                      key = item["title"].lower()
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      out.append(item)
+              return out[:45]
+
+          def build_prompt(items):
+              today_tw = dt.datetime.now(
+                  dt.timezone(dt.timedelta(hours=8))
+              ).strftime("%Y-%m-%d")
+
+              source_lines = "\n".join(
+                  f"- [{i+1}] {x['title']} | {x['source']} | {x['published']} | {x['url']}"
+                  for i, x in enumerate(items)
+              )
+
+              return textwrap.dedent(f"""
+              You are preparing a daily global trends briefing for a Taiwan-based reader.
+              Today is {today_tw} in Asia/Taipei.
+
+              Use the source candidates below. Select 5 to 7 genuinely important and diverse global trend items.
+              Do not limit the digest to Taiwan and do not limit it to AI.
+              Prefer credible, recent, internationally relevant items. Avoid duplicates and clickbait.
+
+              Write the final answer in Traditional Chinese.
+              For English or foreign-language sources, translate and summarize naturally into Traditional Chinese.
+
+              For each item, include:
+              1. Main point.
+              2. Core concept or nature of the event.
+              3. Relevant risks, technical issues, policy problems, implementation challenges, or likely impact when applicable.
+              4. An opposing, skeptical, affected-party, or alternative viewpoint when useful.
+              5. Original title, source name, and URL.
+
+              Each item should be substantial, roughly 150 to 250 Chinese characters or more if needed.
+
+              End with a section titled exactly:
+              今日全球趨勢判讀
+
+              Add 3 to 5 concise bullets about the most important patterns and what deserves continued tracking.
+
+              Source candidates:
+              {source_lines}
+              """).strip()
+
+          def call_openai(prompt):
+              api_key = require_env("OPENAI_API_KEY")
+              model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.2"
+
+              payload = {
+                  "model": model,
+                  "input": prompt,
+              }
+
+              raw = fetch_url(
+                  "https://api.openai.com/v1/responses",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {api_key}",
+                      "Content-Type": "application/json",
+                  },
+              )
+
+              data = json.loads(raw.decode("utf-8"))
+
+              if data.get("output_text"):
+                  return data["output_text"].strip()
+
+              parts = []
+              for output in data.get("output", []):
+                  for content in output.get("content", []):
+                      text = content.get("text")
+                      if text:
+                          parts.append(text)
+
+              if not parts:
+                  raise RuntimeError("OpenAI response contained no text: " + json.dumps(data)[:1000])
+
+              return "\n".join(parts).strip()
+
+          def split_text(text, limit=3900):
+              if len(text) <= limit:
+                  return [text]
+
+              chunks = []
+              current = []
+              current_len = 0
+
+              for paragraph in text.split("\n\n"):
+                  add_len = len(paragraph) + 2
+                  if current and current_len + add_len > limit:
+                      chunks.append("\n\n".join(current))
+                      current = [paragraph]
+                      current_len = add_len
+                  else:
+                      current.append(paragraph)
+                      current_len += add_len
+
+              if current:
+                  chunks.append("\n\n".join(current))
+
+              return chunks
+
+          def send_telegram(message):
+              token = require_env("TELEGRAM_BOT_TOKEN")
+              chat_id = require_env("TELEGRAM_CHAT_ID")
+              url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+              chunks = split_text(message)
+              for i, chunk in enumerate(chunks, start=1):
+                  text = chunk if len(chunks) == 1 else f"{chunk}\n\n({i}/{len(chunks)})"
+                  body = urllib.parse.urlencode({
+                      "chat_id": chat_id,
+                      "text": text,
+                      "disable_web_page_preview": "false",
+                  }).encode("utf-8")
+
+                  raw = fetch_url(url, data=body)
+                  result = json.loads(raw.decode("utf-8"))
+
+                  if not result.get("ok"):
+                      raise RuntimeError("Telegram send failed: " + json.dumps(result))
+
+          items = collect_items()
+          if not items:
+              raise RuntimeError("No news items collected from Google News RSS.")
+
+          digest = call_openai(build_prompt(items))
+          send_telegram(digest)
+          print("Digest sent to Telegram.")
+          PY
