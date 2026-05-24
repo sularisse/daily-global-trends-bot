@@ -12,10 +12,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Generate and send digest
+      - name: Generate and send digest with Gemini
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -26,6 +26,7 @@ jobs:
           import json
           import os
           import textwrap
+          import urllib.error
           import urllib.parse
           import urllib.request
           import xml.etree.ElementTree as ET
@@ -55,8 +56,12 @@ jobs:
                   },
                   method="POST" if data else "GET",
               )
-              with urllib.request.urlopen(req, timeout=30) as res:
-                  return res.read()
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as res:
+                      return res.read()
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
 
           def fetch_google_news(query):
               params = {
@@ -95,12 +100,19 @@ jobs:
               seen = set()
               out = []
               for query in RSS_QUERIES:
-                  for item in fetch_google_news(query):
+                  try:
+                      items = fetch_google_news(query)
+                  except Exception as exc:
+                      print(f"RSS fetch failed for {query}: {exc}")
+                      continue
+
+                  for item in items:
                       key = item["title"].lower()
                       if key in seen:
                           continue
                       seen.add(key)
                       out.append(item)
+
               return out[:45]
 
           def build_prompt(items):
@@ -142,40 +154,50 @@ jobs:
               {source_lines}
               """).strip()
 
-          def call_openai(prompt):
-              api_key = require_env("OPENAI_API_KEY")
-              model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.2"
+          def call_gemini(prompt):
+              api_key = require_env("GEMINI_API_KEY")
+              model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
+
+              url = (
+                  "https://generativelanguage.googleapis.com/v1beta/models/"
+                  + urllib.parse.quote(model, safe="")
+                  + ":generateContent"
+              )
 
               payload = {
-                  "model": model,
-                  "input": prompt,
+                  "contents": [
+                      {
+                          "role": "user",
+                          "parts": [{"text": prompt}],
+                      }
+                  ],
+                  "generationConfig": {
+                      "temperature": 0.4,
+                      "maxOutputTokens": 5000,
+                  },
               }
 
               raw = fetch_url(
-                  "https://api.openai.com/v1/responses",
+                  url,
                   data=json.dumps(payload).encode("utf-8"),
                   headers={
-                      "Authorization": f"Bearer {api_key}",
                       "Content-Type": "application/json",
+                      "x-goog-api-key": api_key,
                   },
               )
 
               data = json.loads(raw.decode("utf-8"))
 
-              if data.get("output_text"):
-                  return data["output_text"].strip()
+              candidates = data.get("candidates") or []
+              if not candidates:
+                  raise RuntimeError("Gemini response contained no candidates: " + json.dumps(data)[:1000])
 
-              parts = []
-              for output in data.get("output", []):
-                  for content in output.get("content", []):
-                      text = content.get("text")
-                      if text:
-                          parts.append(text)
+              parts = candidates[0].get("content", {}).get("parts", [])
+              texts = [p.get("text", "") for p in parts if p.get("text")]
+              if not texts:
+                  raise RuntimeError("Gemini response contained no text: " + json.dumps(data)[:1000])
 
-              if not parts:
-                  raise RuntimeError("OpenAI response contained no text: " + json.dumps(data)[:1000])
-
-              return "\n".join(parts).strip()
+              return "\n".join(texts).strip()
 
           def split_text(text, limit=3900):
               if len(text) <= limit:
@@ -224,7 +246,7 @@ jobs:
           if not items:
               raise RuntimeError("No news items collected from Google News RSS.")
 
-          digest = call_openai(build_prompt(items))
+          digest = call_gemini(build_prompt(items))
           send_telegram(digest)
-          print("Digest sent to Telegram.")
+          print("Digest sent to Telegram via Gemini.")
           PY
